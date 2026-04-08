@@ -58,33 +58,44 @@ def track():
 
 @app.route("/passbook")
 def passbook():
-    pages = int(request.args.get("pages", 5))
+    pages = int(request.args.get("pages", 3))
     try:
         ensure_token()
         all_entries = []
         for page in range(1, pages + 1):
             r = session.get(f"{SR_BASE}/account/details/passbook",
                             params={"per_page": 500, "page": page}, timeout=45)
-            entries = r.json().get("data", [])
+            raw = r.json()
+            # Try all possible keys
+            entries = (raw.get("data") or raw.get("transactions") or 
+                      raw.get("passbook") or raw.get("results") or [])
             if not entries:
-                break
+                # Return raw so we can see structure
+                return jsonify({"raw_sample": raw, "page": page})
             all_entries.extend(entries)
 
-        wb      = session.get(f"{SR_BASE}/account/details/wallet-balance", timeout=20).json()
-        balance = wb.get("data", {}).get("balance") or wb.get("balance", 0)
+        wb = session.get(f"{SR_BASE}/account/details/wallet-balance", timeout=20).json()
+        balance = (wb.get("data", {}).get("balance") or 
+                  wb.get("balance") or wb.get("wallet_balance") or 0)
 
         awb_charges = {}
+        raw_sample = all_entries[0] if all_entries else {}
+
         for e in all_entries:
-            note = (e.get("note") or e.get("description") or e.get("remarks") or "").lower()
-            amt  = abs(float(e.get("debit") or e.get("credit") or e.get("amount") or 0))
-            awb  = str(e.get("awb") or e.get("awb_code") or "").strip()
+            note = (e.get("note") or e.get("description") or 
+                   e.get("remarks") or e.get("title") or e.get("type") or "").lower()
+            amt = abs(float(e.get("debit") or e.get("credit") or 
+                           e.get("amount") or e.get("dr") or 0))
+            awb = str(e.get("awb") or e.get("awb_code") or 
+                     e.get("awb_number") or e.get("tracking_id") or "").strip()
             if not awb:
                 m = re.search(r'\b(\d{10,16})\b', note)
                 if m: awb = m.group(1)
             if not awb or amt == 0:
                 continue
             if awb not in awb_charges:
-                awb_charges[awb] = {"freight": 0, "cod": 0, "rto": 0, "excess_weight": 0, "other": 0, "total": 0}
+                awb_charges[awb] = {"freight":0,"cod":0,"rto":0,
+                                    "excess_weight":0,"other":0,"total":0}
             if "freight" in note or "forward" in note:
                 awb_charges[awb]["freight"] += amt
             elif "cod" in note:
@@ -95,14 +106,15 @@ def passbook():
                 awb_charges[awb]["excess_weight"] += amt
             else:
                 awb_charges[awb]["other"] += amt
-            awb_charges[awb]["total"] = round(sum(
-                v for k, v in awb_charges[awb].items() if k != "total"), 2)
+            awb_charges[awb]["total"] = round(
+                sum(v for k,v in awb_charges[awb].items() if k != "total"), 2)
 
         return jsonify({
-            "wallet_balance":      balance,
+            "wallet_balance": balance,
             "transactions_fetched": len(all_entries),
-            "awbs_with_charges":   len(awb_charges),
-            "charges":             awb_charges
+            "awbs_with_charges": len(awb_charges),
+            "raw_sample": raw_sample,
+            "charges": awb_charges
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
