@@ -1,4 +1,4 @@
-import os, re, time, requests
+import os, time, requests
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
@@ -31,6 +31,7 @@ def ensure_token():
 def health():
     return jsonify({"status": "ok"})
 
+# ── Track single AWB ─────────────────────────────────────────────
 @app.route("/track")
 def track():
     awb = request.args.get("awb", "").strip()
@@ -56,11 +57,13 @@ def track():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ── Charges per AWB from orders ──────────────────────────────────
 @app.route("/charges")
 def charges():
     pages = int(request.args.get("pages", 10))
     try:
         ensure_token()
+
         all_orders = []
         for page in range(1, pages + 1):
             r = session.get(f"{SR_BASE}/orders",
@@ -71,54 +74,84 @@ def charges():
                 break
             all_orders.extend(orders)
 
+        # wallet balance
         wb = session.get(f"{SR_BASE}/account/details/wallet-balance", timeout=20).json()
         balance = (wb.get("data", {}).get("balance") or wb.get("balance") or 0)
 
-        raw_sample = all_orders[0] if all_orders else {}
-
         awb_charges = {}
+
         for o in all_orders:
-            awb = str(o.get("awb_code") or o.get("awb") or "").strip()
+            # AWB is inside shipments array
+            shipments = o.get("shipments") or []
+            awb = ""
+            freight = 0
+            cod_charge = 0
+            rto = 0
+            excess_wt = 0
+
+            if shipments and isinstance(shipments, list):
+                s = shipments[0]
+                awb = str(s.get("awb") or s.get("awb_code") or "").strip()
+                freight   = float(s.get("freight_charges") or s.get("freight") or
+                                  s.get("charge") or s.get("shipping_charges") or 0)
+                cod_charge= float(s.get("cod_charges") or s.get("cod_charge") or 0)
+                rto       = float(s.get("rto_charges") or s.get("rto_charge") or 0)
+                excess_wt = float(s.get("weight_charges") or s.get("excess_weight") or 0)
+
+            # fallback: try order-level fields
+            if not awb:
+                awb = str(o.get("awb_code") or o.get("awb") or
+                          o.get("last_mile_awb") or "").strip()
+
             if not awb:
                 continue
-            freight   = float(o.get("freight_charges") or o.get("freight_total") or
-                              o.get("shipping_charges") or o.get("charge") or 0)
-            cod       = float(o.get("cod_charges") or o.get("cod_charge") or
-                              o.get("cod_handling_charges") or 0)
-            rto       = float(o.get("rto_charges") or o.get("rto_charge") or
-                              o.get("rto_freight") or 0)
-            excess_wt = float(o.get("weight_charges") or o.get("excess_weight_charges") or
-                              o.get("weight_discrepancy") or 0)
-            total     = float(o.get("total") or o.get("total_charges") or
-                              o.get("amount_charged") or 0)
-            if total > 0 and freight == 0 and cod == 0 and rto == 0:
-                freight = total
+
+            # order-level charge fallbacks
+            if freight == 0:
+                freight = float(o.get("freight_charges") or o.get("other_charges") or 0)
+            if cod_charge == 0:
+                cod_val = o.get("cod")
+                if isinstance(cod_val, dict):
+                    cod_charge = float(cod_val.get("charges") or cod_val.get("amount") or 0)
+                elif cod_val:
+                    cod_charge = 0  # cod field is order value not charge
+
+            # total from order if still zero
+            order_total = float(o.get("total") or 0)
+
             awb_charges[awb] = {
                 "name":          o.get("customer_name", ""),
                 "status":        o.get("status", ""),
-                "courier":       o.get("courier_name", ""),
+                "courier":       (shipments[0].get("courier_name","") if shipments else
+                                  o.get("last_mile_courier_name", "")),
                 "freight":       round(freight, 2),
-                "cod":           round(cod, 2),
+                "cod_charge":    round(cod_charge, 2),
                 "rto":           round(rto, 2),
                 "excess_weight": round(excess_wt, 2),
-                "total":         round(freight + cod + rto + excess_wt, 2),
+                "order_total":   round(order_total, 2),
+                "total_charged": round(freight + cod_charge + rto + excess_wt, 2),
             }
+
+        # expose raw shipment keys from first order for debugging
+        raw_shipment_keys = []
+        if all_orders and all_orders[0].get("shipments"):
+            raw_shipment_keys = list(all_orders[0]["shipments"][0].keys())
 
         summary = {
             "freight":       round(sum(v["freight"] for v in awb_charges.values()), 2),
-            "cod":           round(sum(v["cod"] for v in awb_charges.values()), 2),
+            "cod_charge":    round(sum(v["cod_charge"] for v in awb_charges.values()), 2),
             "rto":           round(sum(v["rto"] for v in awb_charges.values()), 2),
             "excess_weight": round(sum(v["excess_weight"] for v in awb_charges.values()), 2),
-            "grand_total":   round(sum(v["total"] for v in awb_charges.values()), 2),
+            "grand_total":   round(sum(v["total_charged"] for v in awb_charges.values()), 2),
         }
 
         return jsonify({
-            "wallet_balance":  balance,
-            "orders_fetched":  len(all_orders),
-            "awbs_found":      len(awb_charges),
-            "summary":         summary,
-            "raw_sample_keys": list(raw_sample.keys()) if raw_sample else [],
-            "charges":         awb_charges
+            "wallet_balance":      balance,
+            "orders_fetched":      len(all_orders),
+            "awbs_found":          len(awb_charges),
+            "summary":             summary,
+            "raw_shipment_keys":   raw_shipment_keys,
+            "charges":             awb_charges
         })
 
     except Exception as e:
