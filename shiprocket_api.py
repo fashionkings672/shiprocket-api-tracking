@@ -56,58 +56,90 @@ def track():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/passbook")
-def passbook():
-    pages = int(request.args.get("pages", 5))
+@app.route("/charges")
+def charges():
+    pages = int(request.args.get("pages", 10))
     try:
         ensure_token()
-        all_entries = []
+        all_orders = []
         for page in range(1, pages + 1):
-            r = session.get(f"{SR_BASE}/account/details/passbook",
+            r = session.get(f"{SR_BASE}/orders",
                             params={"per_page": 500, "page": page}, timeout=45)
-            entries = r.json().get("data", [])
-            if not entries:
+            resp = r.json()
+            orders = resp.get("data", [])
+            if not orders:
                 break
-            all_entries.extend(entries)
+            all_orders.extend(orders)
 
-        wb      = session.get(f"{SR_BASE}/account/details/wallet-balance", timeout=20).json()
-        balance = wb.get("data", {}).get("balance") or wb.get("balance", 0)
+        wb = session.get(f"{SR_BASE}/account/details/wallet-balance", timeout=20).json()
+        balance = (wb.get("data", {}).get("balance") or wb.get("balance") or 0)
+
+        raw_sample = all_orders[0] if all_orders else {}
 
         awb_charges = {}
-        for e in all_entries:
-            note = (e.get("note") or e.get("description") or e.get("remarks") or "").lower()
-            amt  = abs(float(e.get("debit") or e.get("credit") or e.get("amount") or 0))
-            awb  = str(e.get("awb") or e.get("awb_code") or "").strip()
+        for o in all_orders:
+            awb = str(o.get("awb_code") or o.get("awb") or "").strip()
             if not awb:
-                m = re.search(r'\b(\d{10,16})\b', note)
-                if m: awb = m.group(1)
-            if not awb or amt == 0:
                 continue
-            if awb not in awb_charges:
-                awb_charges[awb] = {"freight": 0, "cod": 0, "rto": 0, "excess_weight": 0, "other": 0, "total": 0}
-            if "freight" in note or "forward" in note:
-                awb_charges[awb]["freight"] += amt
-            elif "cod" in note:
-                awb_charges[awb]["cod"] += amt
-            elif "rto" in note:
-                awb_charges[awb]["rto"] += amt
-            elif "weight" in note or "excess" in note:
-                awb_charges[awb]["excess_weight"] += amt
-            else:
-                awb_charges[awb]["other"] += amt
-            awb_charges[awb]["total"] = round(sum(
-                v for k, v in awb_charges[awb].items() if k != "total"), 2)
+            freight   = float(o.get("freight_charges") or o.get("freight_total") or
+                              o.get("shipping_charges") or o.get("charge") or 0)
+            cod       = float(o.get("cod_charges") or o.get("cod_charge") or
+                              o.get("cod_handling_charges") or 0)
+            rto       = float(o.get("rto_charges") or o.get("rto_charge") or
+                              o.get("rto_freight") or 0)
+            excess_wt = float(o.get("weight_charges") or o.get("excess_weight_charges") or
+                              o.get("weight_discrepancy") or 0)
+            total     = float(o.get("total") or o.get("total_charges") or
+                              o.get("amount_charged") or 0)
+            if total > 0 and freight == 0 and cod == 0 and rto == 0:
+                freight = total
+            awb_charges[awb] = {
+                "name":          o.get("customer_name", ""),
+                "status":        o.get("status", ""),
+                "courier":       o.get("courier_name", ""),
+                "freight":       round(freight, 2),
+                "cod":           round(cod, 2),
+                "rto":           round(rto, 2),
+                "excess_weight": round(excess_wt, 2),
+                "total":         round(freight + cod + rto + excess_wt, 2),
+            }
+
+        summary = {
+            "freight":       round(sum(v["freight"] for v in awb_charges.values()), 2),
+            "cod":           round(sum(v["cod"] for v in awb_charges.values()), 2),
+            "rto":           round(sum(v["rto"] for v in awb_charges.values()), 2),
+            "excess_weight": round(sum(v["excess_weight"] for v in awb_charges.values()), 2),
+            "grand_total":   round(sum(v["total"] for v in awb_charges.values()), 2),
+        }
 
         return jsonify({
-            "wallet_balance":      balance,
-            "transactions_fetched": len(all_entries),
-            "awbs_with_charges":   len(awb_charges),
-            "charges":             awb_charges
+            "wallet_balance":  balance,
+            "orders_fetched":  len(all_orders),
+            "awbs_found":      len(awb_charges),
+            "summary":         summary,
+            "raw_sample_keys": list(raw_sample.keys()) if raw_sample else [],
+            "charges":         awb_charges
         })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/passbook")
+def passbook():
+    return charges()
+
+@app.route("/wallet")
+def wallet():
+    try:
+        ensure_token()
+        wb = session.get(f"{SR_BASE}/account/details/wallet-balance", timeout=20).json()
+        balance = (wb.get("data", {}).get("balance") or wb.get("balance") or 0)
+        return jsonify({"wallet_balance": balance})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     ensure_token()
     print("Token OK")
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
