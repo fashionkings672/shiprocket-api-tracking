@@ -57,7 +57,7 @@ def track():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Charges per AWB from orders ──────────────────────────────────
+# ── Charges per AWB ──────────────────────────────────────────────
 @app.route("/charges")
 def charges():
     pages = int(request.args.get("pages", 10))
@@ -81,77 +81,48 @@ def charges():
         awb_charges = {}
 
         for o in all_orders:
-            # AWB is inside shipments array
             shipments = o.get("shipments") or []
-            awb = ""
-            freight = 0
-            cod_charge = 0
-            rto = 0
-            excess_wt = 0
+            if not shipments:
+                continue
 
-            if shipments and isinstance(shipments, list):
-                s = shipments[0]
-                awb = str(s.get("awb") or s.get("awb_code") or "").strip()
-                freight   = float(s.get("freight_charges") or s.get("freight") or
-                                  s.get("charge") or s.get("shipping_charges") or 0)
-                cod_charge= float(s.get("cod_charges") or s.get("cod_charge") or 0)
-                rto       = float(s.get("rto_charges") or s.get("rto_charge") or 0)
-                excess_wt = float(s.get("weight_charges") or s.get("excess_weight") or 0)
-
-            # fallback: try order-level fields
-            if not awb:
-                awb = str(o.get("awb_code") or o.get("awb") or
-                          o.get("last_mile_awb") or "").strip()
-
+            s   = shipments[0]
+            awb = str(s.get("awb") or "").strip()
             if not awb:
                 continue
 
-            # order-level charge fallbacks
-            if freight == 0:
-                freight = float(o.get("freight_charges") or o.get("other_charges") or 0)
-            if cod_charge == 0:
-                cod_val = o.get("cod")
-                if isinstance(cod_val, dict):
-                    cod_charge = float(cod_val.get("charges") or cod_val.get("amount") or 0)
-                elif cod_val:
-                    cod_charge = 0  # cod field is order value not charge
+            # CONFIRMED field names from raw_shipment_keys
+            freight    = float(s.get("shipping_charges") or 0)
+            cost       = float(s.get("cost") or 0)      # total deducted from wallet
+            s_total    = float(s.get("total") or 0)     # shipment total
+            cod_amount = float(o.get("total") or 0)     # COD order value
 
-            # total from order if still zero
-            order_total = float(o.get("total") or 0)
+            # cost = total deducted. freight breakdown not split in API.
+            # Use cost as total_charged, freight as shipping component
+            total_charged = cost if cost > 0 else freight
 
+            # COD handling is typically 1.5-2% of COD amount (not in API separately)
+            # RTO and excess weight not exposed separately in API
             awb_charges[awb] = {
-                "name":          o.get("customer_name", ""),
-                "status":        o.get("status", ""),
-                "courier":       (shipments[0].get("courier_name","") if shipments else
-                                  o.get("last_mile_courier_name", "")),
-                "freight":       round(freight, 2),
-                "cod_charge":    round(cod_charge, 2),
-                "rto":           round(rto, 2),
-                "excess_weight": round(excess_wt, 2),
-                "order_total":   round(order_total, 2),
-                "total_charged": round(freight + cod_charge + rto + excess_wt, 2),
+                "name":           o.get("customer_name", ""),
+                "status":         o.get("status", ""),
+                "courier":        s.get("courier") or s.get("sr_courier_name", ""),
+                "cod_amount":     round(cod_amount, 2),
+                "freight":        round(freight, 2),
+                "total_deducted": round(total_charged, 2),
             }
 
-        # expose raw shipment keys from first order for debugging
-        raw_shipment_keys = []
-        if all_orders and all_orders[0].get("shipments"):
-            raw_shipment_keys = list(all_orders[0]["shipments"][0].keys())
-
         summary = {
-            "freight":       round(sum(v["freight"] for v in awb_charges.values()), 2),
-            "cod_charge":    round(sum(v["cod_charge"] for v in awb_charges.values()), 2),
-            "rto":           round(sum(v["rto"] for v in awb_charges.values()), 2),
-            "excess_weight": round(sum(v["excess_weight"] for v in awb_charges.values()), 2),
-            "grand_total":   round(sum(v["total_charged"] for v in awb_charges.values()), 2),
+            "total_freight":   round(sum(v["freight"] for v in awb_charges.values()), 2),
+            "total_deducted":  round(sum(v["total_deducted"] for v in awb_charges.values()), 2),
+            "total_cod_value": round(sum(v["cod_amount"] for v in awb_charges.values()), 2),
         }
 
         return jsonify({
-            "wallet_balance":      balance,
-            "orders_fetched":      len(all_orders),
-            "awbs_found":          len(awb_charges),
-            "summary":             summary,
-            "raw_shipment_keys":   raw_shipment_keys,
-            "charges":             awb_charges
+            "wallet_balance": balance,
+            "orders_fetched": len(all_orders),
+            "awbs_found":     len(awb_charges),
+            "summary":        summary,
+            "charges":        awb_charges
         })
 
     except Exception as e:
